@@ -17,7 +17,7 @@ GET_BIRTH_DATE = 0
 GET_BIRTH_CITY = 1
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # --- Инициализация Gemini API ---
 genai.configure(api_key=GEMINI_API_KEY)
