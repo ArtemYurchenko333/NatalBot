@@ -1,29 +1,93 @@
 import logging
 import os
+import psycopg2 # Импортируем библиотеку для работы с PostgreSQL
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import google.generativeai as genai
 
 # --- Настройка логирования ---
-# Это поможет тебе видеть, что происходит с ботом, если возникнут ошибки.
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # --- Переменные для состояний разговора ---
-# Эти переменные определяют шаги в нашем диалоге с пользователем.
 GET_BIRTH_DATE = 0
 GET_BIRTH_CITY = 1
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL") # Новая переменная для URL базы данных
+
+# Проверка наличия всех необходимых переменных окружения
+if not TELEGRAM_BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN не установлен в переменных окружения.")
+    exit(1)
+if not GEMINI_API_KEY:
+    logger.error("GEMINI_API_KEY не установлен в переменных окружения.")
+    exit(1)
+if not DATABASE_URL:
+    logger.error("DATABASE_URL не установлен в переменных окружения.")
+    exit(1)
 
 # --- Инициализация Gemini API ---
 genai.configure(api_key=GEMINI_API_KEY)
-# Выбираем модель Gemini, которую будем использовать.
-# 'gemini-pro' - хорошая универсальная модель.
 model = genai.GenerativeModel('models/gemini-1.5-flash')
+
+# --- Функции для работы с базой данных ---
+
+def get_db_connection():
+    """Устанавливает соединение с базой данных PostgreSQL."""
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        logger.info("Успешно подключено к базе данных PostgreSQL.")
+        return conn
+    except Exception as e:
+        logger.error(f"Ошибка подключения к базе данных: {e}")
+        return None
+
+def create_table_if_not_exists():
+    """Создает таблицу natal_readings, если она еще не существует."""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS natal_readings (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    birth_date VARCHAR(10) NOT NULL,
+                    birth_city VARCHAR(255) NOT NULL,
+                    gemini_response TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+            logger.info("Таблица natal_readings проверена/создана.")
+        except Exception as e:
+            logger.error(f"Ошибка при создании таблицы: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+async def save_reading_to_db(user_id: int, birth_date: str, birth_city: str, gemini_response: str):
+    """Сохраняет данные натальной карты в базу данных."""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO natal_readings (user_id, birth_date, birth_city, gemini_response)
+                VALUES (%s, %s, %s, %s);
+            """, (user_id, birth_date, birth_city, gemini_response))
+            conn.commit()
+            logger.info(f"Запись для пользователя {user_id} успешно сохранена в БД.")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении в базу данных: {e}")
+        finally:
+            if conn:
+                conn.close()
 
 # --- Функции-обработчики команд и сообщений ---
 
@@ -35,32 +99,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"Привет, {user.mention_html()}! Я могу помочь тебе узнать немного о твоей натальной карте. "
         "Пожалуйста, введи свою дату рождения в формате ДД.ММ.ГГГГ (например, 01.01.2000):"
     )
-    # Устанавливаем следующее состояние разговора
     return GET_BIRTH_DATE
 
 # Обработчик для получения даты рождения
 async def get_birth_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Получает дату рождения и запрашивает город."""
     user_birth_date = update.message.text
-    # Здесь можно добавить проверку формата даты, если нужно.
     context.user_data['birth_date'] = user_birth_date
     await update.message.reply_text(
         "Отлично! Теперь, пожалуйста, введи город твоего рождения:"
     )
-    # Переходим к следующему состоянию
     return GET_BIRTH_CITY
 
 # Обработчик для получения города рождения и отправки запроса в Gemini
 async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Получает город рождения, формирует запрос для Gemini и отправляет ответ."""
+    user = update.effective_user
+    user_id = user.id
     user_birth_city = update.message.text
     birth_date = context.user_data['birth_date']
 
     await update.message.reply_text("Спасибо! Генерирую информацию по твоей натальной карте. Это может занять немного времени...")
 
-    # Формируем промт для Gemini
-    # Здесь ты можешь быть более конкретным в запросе к Gemini,
-    # чтобы получить желаемый формат натальной карты.
     prompt_text = (
         f"Создай очень краткую и обобщенную натальную карту для человека, "
         f"родившегося {birth_date} в городе {user_birth_city}. "
@@ -68,27 +128,29 @@ async def get_birth_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Представь информацию в формате, удобном для чтения, без излишних астрологических терминов."
     )
 
+    gemini_response_text = "" # Инициализируем пустой строкой
     try:
-        # Отправляем запрос в Gemini
         response = model.generate_content(
-    prompt_text,
-    safety_settings=[
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-)
+            prompt_text,
+            safety_settings=[
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+        )
         gemini_response_text = response.text
-        # Отправляем ответ от Gemini пользователю
         await update.message.reply_text(gemini_response_text)
+
+        # Сохраняем данные в базу данных после успешного получения ответа
+        await save_reading_to_db(user_id, birth_date, user_birth_city, gemini_response_text)
+
     except Exception as e:
         logger.error(f"Ошибка при обращении к Gemini API: {e}")
         await update.message.reply_text(
             "Извини, произошла ошибка при получении информации от Gemini. Попробуй еще раз позже."
         )
 
-    # Завершаем разговор
     return ConversationHandler.END
 
 # Обработчик для команды /cancel (отмена разговора)
@@ -99,7 +161,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         'Диалог отменен. Если хочешь начать сначала, используй команду /start.'
     )
-    # Завершаем разговор
     return ConversationHandler.END
 
 # Обработчик для неизвестных команд
@@ -109,10 +170,11 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Основная функция для запуска бота ---
 def main() -> None:
     """Запускает бота."""
-    # Создаем объект Application и передаем ему токен бота.
+    # Создаем таблицу, если ее нет, при запуске бота
+    create_table_if_not_exists()
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Создаем ConversationHandler для управления потоком диалога
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -123,9 +185,8 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
-    application.add_handler(MessageHandler(filters.COMMAND, unknown)) # Добавляем обработчик для неизвестных команд вне ConversationHandler
+    application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Запускаем бота
     logger.info("Бот запущен. Ожидание сообщений...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
